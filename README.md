@@ -14,7 +14,7 @@
 
 ## Установка
 1. Клонируйте репозиторий:  
-https://github.com/AsanTU/Reminder-Bot
+https://github.com/AsanTU/Reminder-Bot.git
 
 2. Установите зависимости:  
 pip3 install -r requirements.txt
