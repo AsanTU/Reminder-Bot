@@ -1,4 +1,6 @@
 import sqlite3
+from dotenv import load_dotenv
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message
@@ -8,8 +10,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import asyncio
 
+load_dotenv()
+
+API_TOKEN = os.getenv("API_TOKEN")
+
 # Создаем бота и диспетчер
-API_TOKEN = "7561419022:AAEcftzg_YrAHkJMMbxAuZagCJqH_AAXd9s"
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
