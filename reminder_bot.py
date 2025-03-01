@@ -6,6 +6,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.markdown import hbold
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import logging
@@ -106,6 +107,14 @@ class Database:
         self.cursor.execute("UPDATE reminders SET text = ? WHERE id = ?", (new_text, reminder_id))
         self.conn.commit()
         self.conn.close
+
+    def get_expired_reminders(self, now):
+        self.cursor.execute("SELECT user_id, text, time FROM reminders WHERE time < ? AND sent = 0", (now,))
+        return self.cursor.fetchall()
+
+    def mark_reminder_as_sent(self, reminder_id):
+        self.cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+        self.conn.commit()
 
 db = Database()
 
@@ -387,6 +396,33 @@ async def input_text(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Ошибка! Не удалось обработать дату напоминания.")
 
+async def restore_pending_reminders():
+    now = datetime.now()
+    expired_reminders = db.get_pending_reminders(now)
+
+    for reminder in expired_reminders:
+        user_id, text, reminder_time = reminder
+        local_time = convert_to_user_timezone(reminder_time, "Europe/Moscow")
+
+        message_text = (
+            f"⏳ {hbold('Пропущенное напоминание!')}\n\n"
+            f"{hbold('Текст:')} {text}\n"
+            f"{hbold('Ожидалось в:')} {local_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+            "⚠️ Бот был отключен, поэтому напоминание не сработало вовремя."
+        )
+
+        try:
+            await bot.send_message(user_id, message_text)
+            db.mark_reminder_as_sent(reminder[0])
+        except Exception as e:
+            print(f"Ошибка при отправке напоминания {reminder[0]}: {e}")
+
+    print("✅ Восстановление напоминаний завершено.")
+
+async def on_startup():
+    print("🔄 Проверка пропущенных напоминаний...")
+    await restore_pending_reminders()
+
 # Запуск бота
 async def main():
     schedule_reminders()
@@ -394,4 +430,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(on_startup())
+    dp.run_polling(bot)
