@@ -1,8 +1,8 @@
 import sqlite3
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -16,19 +16,21 @@ logging.basicConfig(level=logging.INFO)
 
 API_TOKEN = "7561419022:AAEcftzg_YrAHkJMMbxAuZagCJqH_AAXd9s"
 
-TIMEZONES = list(pytz.all_timezones)
+TIMEZONES = list (map(str.capitalize, pytz.all_timezones))
 
 COUNTRY_TIMEZONES = {
-    "Россия": "Europe/Moscow",
-    "США": "America/New_York",
-    "Казахстан": "Asia/Almaty",
-    "Киргизия": "Asia/Bishkek",
-    "Германия": "Europe/Berlin"
+    "Россия": ["Europe/Moscow", "Asia/Yekaterinburg", "Asia/Krasnoyarsk"],
+    "США": ["America/New_York", "America/Chicago", "America/Los_Angeles"],
+    "Казахстан": ["Asia/Almaty", "Asia/Aqtobe"],
+    "Кыргызстан": ["Asia/Bishkek"],
 }
 
 # Создаем бота и диспетчер
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+print("✅ Router подключён!")  # Лог в консоли
+
 scheduler = AsyncIOScheduler()
 
 # --- Работа с БД ---
@@ -91,17 +93,35 @@ class Database:
 
     def update_user_timezone(self, user_id, timezone):
         """Обновляет часовой пояс пользователя в базе данных"""
-        query = "UPDATE users SET timezone = ? WHERE id = ?"
+        query = "UPDATE users SET timezone = ? WHERE user_id = ?"
         self.cursor.execute(query, (timezone, user_id))
-        self.connection.commit()
+        self.conn.commit()
+        self.conn.close()
+
+    def delete_reminder(self, reminder_id):
+        self.cursor.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        self.conn.commit()
+
+    def update_reminder_text(self, reminder_id: int, new_text: str):
+        self.cursor.execute("UPDATE reminders SET text = ? WHERE id = ?", (new_text, reminder_id))
+        self.conn.commit()
+        self.conn.close
 
 db = Database()
 
 # --- FSM для пошагового создания напоминания ---
 class ReminderStates(StatesGroup):
+    waiting_for_country = State()
+    waiting_for_timezone = State()
     waiting_for_date = State()
     waiting_for_time = State()
     waiting_for_text = State()
+    waiting_for_note = State()
+
+class EditReminderState(StatesGroup):
+    waiting_for_new_text = State()
+
+user_timezones = {}
 
 # --- Отправка напоминания ---
 async def send_reminder(chat_id, text, reminder_id=None):
@@ -130,27 +150,43 @@ def schedule_reminders():
             logging.error(f"Ошибка планирования напоминания: {e}")
 
 def convert_to_utc(user_time: str, user_timezone: str) -> str:
-    user_tz = pytz.timezone(user_timezone)
-    local_time = datetime.strptime(user_time, "%Y-%m-%d %H:%M")
-    local_time = user_tz.localize(local_time)
-    utc_time = local_time.astimezone(pytz.utc)
-    return utc_time.strftime("%Y-%m-%d %H:%M")
+    try:
+        user_tz = pytz.timezone(user_timezone)
+        local_time = datetime.strptime(user_time, "%Y-%m-%d %H:%M")
+        local_time = user_tz.localize(local_time)
+        utc_time = local_time.astimezone(pytz.utc)
+        return utc_time.strftime("%Y-%m-%d %H:%M")
+    except Exception as e:
+        print(f"Ошибка в convert_to_utc: {e}")
+        return user_time
 
-def convert_to_user_timezone(utc_time: str, user_timezone: str) -> str:
-    user_tz = pytz.timezone(user_timezone)
-    utc_dt = datetime.strptime(utc_time, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.utc)
-    local_dt = utc_dt.astimezone(user_tz)
-    return local_dt.strftime("%Y-%m-%d %H:%M")
+def convert_to_user_timezone(utc_time, user_timezone):
+    if not isinstance(user_timezone, str):
+        print(f"Ошибка: user_timezone должен быть строкой, а не {type(user_timezone)}")
+        return utc_time
+    
+    try:
+        user_tz = pytz.timezone(user_timezone)
+
+        if isinstance(utc_time, str):
+            utc_time = datetime.strptime(utc_time, "%Y-%m-%d %H:%M")
+            utc_time = pytz.utc.localize(utc_time)
+
+        return utc_time.astimezone(user_tz)
+    except Exception as e:
+        print(f"Ошибка в convert_to_user_timezone: {e}")
+        return utc_time
 
 # --- Команды бота ---
 @dp.message(Command(commands=["start"]))
-async def start(message: Message):
+async def start(message: types.Message):
     """Отображаем кнопку 'Добавить напоминание' и 'Удалить напоминание'."""
+    print("Функция start() вызвана!")  # Проверка вызова
+
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="Добавить напоминание"), 
-                KeyboardButton(text="Удалить напоминание"), 
+                KeyboardButton(text="Добавить напоминание"),
                 KeyboardButton(text="Мои напоминания")
             ],
             [KeyboardButton(text="Выбрать часовой пояс")]
@@ -158,22 +194,45 @@ async def start(message: Message):
         resize_keyboard=True
     )
     await message.answer("Добро пожаловать! Выберите действие:", reply_markup=keyboard)
+    
 
-# --- Удаление напоминаний ---
-@dp.message(lambda message: message.text == "Удалить напоминание")
+@router.message(F.text == "Мои напоминания")
 async def show_reminders(message: Message):
     """Отображаем список напоминаний с кнопками для удаления."""
-    reminders = db.get_pending_reminders()
-    if not reminders:
+    user_reminders = db.get_pending_reminders(message.from_user.id)
+
+    if not user_reminders:
         await message.answer("У вас нет активных напоминаний.")
         return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{rem[3]} ({rem[2]})", callback_data=f"delete_{rem[0]}")]
-        for rem in reminders
-    ])
     
-    await message.answer("Выберите напоминание для удаления:", reply_markup=keyboard)
+    for reminder in user_reminders:
+        inline_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"done_{reminder[0]}"),
+                    InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{reminder[0]}"),
+                    InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{reminder[0]}")
+                ]
+            ]
+        )
+        await message.answer(reminder[3], reply_markup=inline_keyboard)
+
+@router.callback_query(F.data.startswith(("done_", "edit_", "delete_")))
+async def reminder_action(callback_query: types.CallbackQuery, state: FSMContext):
+    action, reminder_id = callback_query.data.split("_")
+    reminder_id = int(reminder_id)
+
+    if action == "done":
+        await callback_query.message.edit_text("✅ Напоминание выполнено!")
+    elif action == "edit":
+        await state.update_data(reminder_id=reminder_id)
+        await state.set_state(EditReminderState.waiting_for_new_text)
+        await callback_query.message.edit_text("✏️ Введите новое напоминание:")
+    elif action == "delete":
+        db.delete_reminder(reminder_id)
+        await callback_query.message.edit_text("❌ Напоминание удалено!")
+
+    await callback_query.answer()
 
 @dp.callback_query(lambda call: call.data.startswith("delete_"))
 async def delete_reminder(call: CallbackQuery):
@@ -186,6 +245,21 @@ async def delete_reminder(call: CallbackQuery):
 
     await call.answer("Напоминание удалено!")
     await call.message.edit_text("Напоминание успешно удалено.")
+
+@router.message(EditReminderState.waiting_for_new_text)
+async def process_new_text(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    reminder_id = user_data.get("reminder_id")
+
+    if reminder_id is None:
+        await message.answer("⚠ Ошибка: не найдено напоминание для редактирования.")
+        return
+    
+    db.update_reminder_text(reminder_id, message.text)
+    await message.answer(f"✅ Напоминание {reminder_id} обновлено: {message.text}")
+    await state.clear()
+
+dp.include_router(router)
 
 @dp.message(lambda message: message.text == "Добавить напоминание")
 async def start_reminder(message: Message, state: FSMContext):
@@ -204,92 +278,114 @@ async def set_timezone(message: types.Message):
 
     await message.answer("Выберите вашу страну:", reply_markup=keyboard)
 
-@dp.message()
-async def handle_timezone_selection(message: types.Message):
-    country = message.text.strip()
+@dp.message(lambda message: message.text in COUNTRY_TIMEZONES)
+async def choose_timezone(message: types.Message, state: FSMContext):
+    country = message.text
+    timezones = COUNTRY_TIMEZONES[country]
 
-    if country in COUNTRY_TIMEZONES:
-        timezone = COUNTRY_TIMEZONES[country]
-        await message.answer(f"Ваш часовой пояс установлен: {timezone}")
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=tz)] for tz in timezones],
+        resize_keyboard=True
+    )
 
-        db.update_reminder_status(message.chat.id, timezone)
+    await message.answer("Выберите ваш часовой пояс:", reply_markup=keyboard)
 
-    else:
-        await message.answer("Некорректный выбор. Выберите страну из списка.")
-
-@dp.message()
-async def save_timezone(message: types.Message):
+@dp.message(lambda message: message.text in pytz.all_timezones)
+async def save_timezone(message: types.Message, state: FSMContext):
     user_timezone = message.text.strip()
 
-    if user_timezone in TIMEZONES:
-        db.update_reminder_status(message.chat.id, user_timezone)
-        await message.answer(f"Ваш часовой пояс установлен на {user_timezone}.")
-    else:
-        await message.answer("Некорректный часовой пояс. Попробуйте ещё раз.")
+    await state.update_data(user_timezone=user_timezone)
+    await message.answer(f"Ваш часовой пояс установлен на {user_timezone}.")
+    await state.set_state(ReminderStates.waiting_for_date)
+    await start(message)
 
-# --- Получение активных напоминаний пользователя ---
-@dp.message(lambda message: message.text == "Мои напоминания")
-async def my_reminders(message: Message):
-    """Выводит список всех активных напоминаний пользователя."""
-    user_reminders = db.get_pending_reminders(message.chat.id)
-    reminders = db.get_pending_reminders(message.chat.id)
-
-    if not user_reminders:
-        await message.answer("У вас нет активных напоминаний.")
-        return
-    
-    reminders_text = "📌 Ваши активные напоминания:\n\n"
-    for reminder in reminders:
-        local_time = convert_to_user_timezone(r[2], user_reminders)
-        reminders_text += f"🕒 {reminder[2]} - {local_time}\n"
-
-    await message.answer(reminders_text)
+logging.basicConfig(level=logging.DEBUG)
 
 @dp.message(ReminderStates.waiting_for_date)
 async def input_date(message: Message, state: FSMContext):
     """Сохраняем дату напоминания."""
     try:
+        user_data = await state.get_data()
+        user_timezone = user_data.get("user_timezone", "UTC")
+        timezone = pytz.timezone(user_timezone)
+
         date = datetime.strptime(message.text, "%Y-%m-%d")
-        if date.date() < datetime.today().date():
-            await message.answer("Дата не может быть в прошлом. Попробуйте снова.")
+        date = timezone.localize(date)
+
+        now = datetime.now(timezone)
+        if date.date() < now.date():
+            await message.answer("❌ Дата не может быть в прошлом. Попробуйте снова.")
             return
+        
         await state.update_data(remind_date=date.strftime("%Y-%m-%d"))
-        await message.answer("Введите время в формате HH:MM:")
+        await message.answer("📅 Дата сохранена! Теперь введите время в формате HH:MM:")
         await state.set_state(ReminderStates.waiting_for_time)
     except ValueError:
-        await message.answer("Некорректный формат даты. Попробуйте снова.")
+        await message.answer("❌ Некорректный формат даты. Попробуйте снова.")
 
 @dp.message(ReminderStates.waiting_for_time)
-async def input_time(message: Message, state: FSMContext):
+async def input_time(message: types.Message, state: FSMContext):
     """Сохраняем время напоминания."""
     try:
+        user_data = await state.get_data()
+        user_timezone = user_data.get("user_timezone", "UTC")
+        timezone = pytz.timezone(user_timezone)
+
         time = datetime.strptime(message.text, "%H:%M").time()
-        await state.update_data(remind_time=time.strftime("%H:%M"))
-        await message.answer("Введите текст напоминания:")
+
+        remind_date = user_data.get("remind_date")
+        if not remind_date:
+            await message.answer("❌ Сначала введите дату напоминания.")
+            return
+        
+        remind_datetime = datetime.strptime(remind_date, "%Y-%m-%d").replace(
+            hour=time.hour, minute=time.minute
+        )
+
+        remind_datetime = timezone.localize(remind_datetime)
+
+        now = datetime.now(timezone)
+        if remind_datetime < now:
+            await message.answer("❌ Время не может быть в прошлом. Попробуйте снова.")
+            return
+        
+        await state.update_data(remind_time=message.text, remind_datetime=remind_datetime.strftime("%Y-%m-%d %H:%M"))
+
+        await message.answer("⏳ Время сохранено! Введите текст напоминания:")
         await state.set_state(ReminderStates.waiting_for_text)
     except ValueError:
-        await message.answer("Некорректный формат времени. Попробуйте снова.")
+        await message.answer("❌ Некорректный формат времени. Попробуйте снова.")
 
 @dp.message(ReminderStates.waiting_for_text)
-async def input_text(message: Message, state: FSMContext):
+async def input_text(message: types.Message, state: FSMContext):
     """Сохраняем текст напоминания и планируем его."""
-    user_data = await state.get_data()
-    remind_datetime = f"{user_data['remind_date']} {user_data['remind_time']}"
+    reminder_text = message.text.strip()
+
+    # Получаем сохранённую дату и время из состояния
+    data = await state.get_data()
+    remind_datetime_str = data.get("remind_datetime")
+
+    if remind_datetime_str is None:
+        await message.answer("❌ Ошибка! Сначала введите дату и время в формате 'YYYY-MM-DD HH:MM'.")
+        return
 
     try:
-        remind_text_dt = datetime.strptime(remind_datetime, "%Y-%m-%d %H:%M")
-        if remind_text_dt < datetime.now():
-            await message.answer("Время не может быть в прошлом. Попробуйте снова.")
-            return
-    except ValueError:
-        await message.answer("Ошибка обработки даты. Попробуйте снова.")
-        return
-    
-    db.add_reminder(message.chat.id, remind_datetime, message.text)
-    scheduler.add_job(send_reminder, DateTrigger(run_date=remind_text_dt), args=[message.chat.id, message.text])
+        # Преобразуем строку обратно в datetime
+        remind_datetime = datetime.strptime(remind_datetime_str, "%Y-%m-%d %H:%M")
 
-    await message.answer(f"✅ Напоминание добавлено: {message.text} в {remind_datetime}.")
-    await state.clear()
+        logging.debug(f"✅ Запланированное напоминание: {reminder_text} в {remind_datetime}")
+
+        # Добавляем напоминание в планировщик
+        scheduler.add_job(send_reminder, DateTrigger(run_date=remind_datetime), args=[message.chat.id, reminder_text])
+
+        # Сохраняем в базу данных
+        db.add_reminder(message.chat.id, remind_datetime, reminder_text)
+
+        await message.answer(f"✅ Напоминание добавлено:\n📌 {reminder_text}\n⏰ {remind_datetime.strftime('%Y-%m-%d %H:%M')} (UTC)")
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Ошибка! Не удалось обработать дату напоминания.")
 
 # Запуск бота
 async def main():
