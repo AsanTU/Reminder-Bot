@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,7 +30,6 @@ COUNTRY_TIMEZONES = {
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
-print("✅ Router подключён!")  # Лог в консоли
 
 scheduler = AsyncIOScheduler()
 
@@ -67,12 +66,14 @@ class Database:
             self.cursor.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'UTC'")
             self.conn.commit()
 
-    def add_reminder(self, chat_id, remind_time, text):
+    def add_reminder(self, chat_id, remind_datetime, text=None, voice_file_id=None):
         """Добавляем новое напоминание в базу данных."""
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO reminders (chat_id, remind_time, text, status) VALUES (?, ?, ?, ?)",
-                           (chat_id, remind_time, text, "pending"))
+            cursor.execute("""
+                INSERT INTO reminders (chat_id, remind_datetime, text, status, voice_file_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chat_id, remind_datetime, text, "pending", voice_file_id))
             conn.commit()
 
     def get_pending_reminders(self, chat_id=None):
@@ -129,16 +130,23 @@ class ReminderStates(StatesGroup):
 
 class EditReminderState(StatesGroup):
     waiting_for_new_text = State()
+    waiting_for_new_voice = State()
 
 user_timezones = {}
 
 # --- Отправка напоминания ---
-async def send_reminder(chat_id, text, reminder_id=None):
-    """Отправляем напоминание пользователю."""
+async def send_reminder(chat_id, text=None, voice_file_id=None, reminder_id=None):
+    """Отправляет текстовое или голосовое напоминание пользователю."""
     try:
-        await bot.send_message(chat_id, f"🔔 Напоминание: {text}")
+        if text:
+            await bot.send_message(chat_id, f"⏰ Напоминание:\n📌 {text}")
+        elif voice_file_id:
+            await bot.send_voice(chat_id, voice_file_id)
+
+        # Обновляем статус напоминания, если передан reminder_id
         if reminder_id:
             db.update_reminder_status(reminder_id, "completed")
+    
     except Exception as e:
         logging.error(f"Ошибка отправки напоминания: {e}")
 
@@ -150,9 +158,8 @@ def schedule_reminders():
         try: 
             remind_time = datetime.strptime(reminder[2], "%Y-%m-%d %H:%M")
             scheduler.add_job(
-                send_reminder, 
+                lambda: asyncio.create_task(send_reminder(reminder[1], reminder[3], reminder[0])), 
                 DateTrigger(run_date=remind_time),
-                args=[reminder[1], reminder[3], reminder[0]],
                 misfire_grace_time=3600
             )
         except Exception as e:
@@ -190,7 +197,6 @@ def convert_to_user_timezone(utc_time, user_timezone):
 @dp.message(Command(commands=["start"]))
 async def start(message: types.Message):
     """Отображаем кнопку 'Добавить напоминание' и 'Удалить напоминание'."""
-    print("Функция start() вызвана!")  # Проверка вызова
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -215,16 +221,23 @@ async def show_reminders(message: Message):
         return
     
     for reminder in user_reminders:
+
+        reminder_id, _, remind_time, text, _, voice_file_id = reminder
+
         inline_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"done_{reminder[0]}"),
-                    InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{reminder[0]}"),
-                    InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{reminder[0]}")
+                    InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"done_{reminder_id}"),
+                    InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{reminder_id}"),
+                    InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{reminder_id}")
                 ]
             ]
         )
-        await message.answer(reminder[3], reply_markup=inline_keyboard)
+
+        if text:
+            await message.answer(f"📌 {text}\n⏰ {remind_time}", reply_markup=inline_keyboard)
+        elif voice_file_id:
+            await message.answer_voice(voice_file_id, reply_markup=inline_keyboard)
 
 @router.callback_query(F.data.startswith(("done_", "edit_", "delete_")))
 async def reminder_action(callback_query: types.CallbackQuery, state: FSMContext):
@@ -368,13 +381,20 @@ async def input_time(message: types.Message, state: FSMContext):
 @dp.message(ReminderStates.waiting_for_text)
 async def input_text(message: types.Message, state: FSMContext):
     """Сохраняем текст напоминания и планируем его."""
-    reminder_text = message.text.strip()
-
-    # Получаем сохранённую дату и время из состояния
+    if message.voice:
+        voice_file_id = message.voice.file_id
+        reminder_text = None
+    elif message.text:
+        reminder_text = message.text.strip()
+        voice_file_id = None
+    else:
+        await message.asnwer("❌ Ошибка! Отправьте текстовое или голосовое сообщение.")
+        return
+    
     data = await state.get_data()
     remind_datetime_str = data.get("remind_datetime")
 
-    if remind_datetime_str is None:
+    if not remind_datetime_str:
         await message.answer("❌ Ошибка! Сначала введите дату и время в формате 'YYYY-MM-DD HH:MM'.")
         return
 
@@ -385,12 +405,11 @@ async def input_text(message: types.Message, state: FSMContext):
         logging.debug(f"✅ Запланированное напоминание: {reminder_text} в {remind_datetime}")
 
         # Добавляем напоминание в планировщик
-        scheduler.add_job(send_reminder, DateTrigger(run_date=remind_datetime), args=[message.chat.id, reminder_text])
+        scheduler.add_job(send_reminder, DateTrigger(run_date=remind_datetime), args=[message.chat.id, reminder_text, voice_file_id])
 
-        # Сохраняем в базу данных
-        db.add_reminder(message.chat.id, remind_datetime, reminder_text)
+        db.add_reminder(message.chat.id, remind_datetime, reminder_text or "Без текста", voice_file_id)
 
-        await message.answer(f"✅ Напоминание добавлено:\n📌 {reminder_text}\n⏰ {remind_datetime.strftime('%Y-%m-%d %H:%M')} (UTC)")
+        await message.answer(f"✅ Напоминание добавлено!")
         await state.clear()
 
     except ValueError:
@@ -425,10 +444,11 @@ async def on_startup():
 
 # Запуск бота
 async def main():
+    await on_startup()
     schedule_reminders()
     scheduler.start()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(on_startup())
+    asyncio.run(main())
     dp.run_polling(bot)
